@@ -498,7 +498,7 @@ describe('Message Type Schemas', () => {
 
       const body = await res.json();
       assert.equal(body.type, 'OTM');
-      assert.equal(body.version, 1);
+      assert.equal(body.version, '1.0');
       assert.ok(body.fields.event_type, 'should have event_type field');
       assert.equal(body.fields.event_type.required, true);
     });

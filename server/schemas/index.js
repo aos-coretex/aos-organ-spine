@@ -12,7 +12,10 @@ import { apmSchema } from './apm.js';
 import { pemSchema } from './pem.js';
 import { atmSchema } from './atm.js';
 import { homSchema } from './hom.js';
-import { VALID_MESSAGE_TYPES, envelopeSchema } from './envelope.js';
+import { VALID_MESSAGE_TYPES, envelopeSchema, ENVELOPE_VERSION } from './envelope.js';
+
+export const SCHEMA_VERSION = '1.0';
+export const SCHEMA_LOCK_DATE = '2026-04-12';
 
 export const schemas = {
   OTM: otmSchema,
@@ -22,4 +25,4 @@ export const schemas = {
   HOM: homSchema,
 };
 
-export { VALID_MESSAGE_TYPES, envelopeSchema };
+export { VALID_MESSAGE_TYPES, envelopeSchema, ENVELOPE_VERSION };
