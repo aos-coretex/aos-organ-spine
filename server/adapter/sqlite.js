@@ -9,6 +9,38 @@
 
 import { StorageAdapter } from './interface.js';
 import { generateUrn } from '../../lib/urn.js';
+import { Worker } from 'node:worker_threads';
+import { fileURLToPath } from 'node:url';
+import { dirname, resolve as pathResolve } from 'node:path';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const WORKER_PATH = pathResolve(__dirname, 'sqlite-async-worker.js');
+
+function _workerLog(event, data = {}) {
+  const entry = { timestamp: new Date().toISOString(), event, ...data };
+  process.stdout.write(JSON.stringify(entry) + '\n');
+}
+
+/**
+ * Phase-2 Strand 3 error types for the worker-thread async API.
+ * Per EA Verdict 2 ratification (2026-05-09 1428 R).
+ */
+export class WorkerQueueFullError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'WorkerQueueFullError';
+    this.code = 'WORKER_QUEUE_FULL';
+  }
+}
+
+export class WorkerCrashedError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'WorkerCrashedError';
+    this.code = 'WORKER_CRASHED';
+  }
+}
 
 export class SQLiteStorageAdapter extends StorageAdapter {
 
@@ -17,6 +49,28 @@ export class SQLiteStorageAdapter extends StorageAdapter {
     super();
     this._db = db;
     this._prepareStatements();
+
+    // Phase-2 Strand 3: spawn async worker for off-event-loop ops
+    // (binding-rule #40 architectural-class closure for health-check +
+    // lifecycle-callback hot paths). Per EA Point 1: NOT lazy spawn.
+    // Per EA Verdict 2 path (i): sync init (CREATE TABLE) runs BEFORE
+    // adapter constructor; worker spawns AFTER schema is ready.
+    this._worker = null;
+    this._workerReady = null;
+    this._pendingRequests = new Map();
+    this._nextRequestId = 1;
+    this._queueDepth = 0;
+    this._maxPendingRequests = 1000;
+    this._lastCrashAt = null;
+    this._terminating = false;
+    this._databasePath = db.name;
+
+    // Skip worker for in-memory DBs (test mode); each in-memory db is
+    // connection-private so the worker cannot share schema with main thread.
+    // Async methods fall back to sync execution when this._worker is null.
+    if (this._databasePath && this._databasePath !== ':memory:') {
+      this._spawnWorker();
+    }
   }
 
   _prepareStatements() {
@@ -708,7 +762,211 @@ export class SQLiteStorageAdapter extends StorageAdapter {
     return this._listTablesStmt.all().map(r => r.name);
   }
 
+  // ================================================================
+  // Phase-2 Strand 3: Async worker plumbing (binding-rule #40)
+  // ================================================================
+
+  /**
+   * Spawn the SQLite async worker thread.
+   * Called once at constructor; respawned at most once on crash with 30s
+   * safety window (replacement crash within 30s → process.exit(1) for
+   * LaunchAgent-mediated full Spine restart).
+   */
+  _spawnWorker() {
+    this._worker = new Worker(WORKER_PATH, {
+      workerData: { databasePath: this._databasePath },
+    });
+
+    this._workerReady = new Promise((resolve, reject) => {
+      const onReadyMsg = (msg) => {
+        if (msg && msg.type === 'ready') {
+          this._worker.off('message', onReadyMsg);
+          resolve();
+        }
+      };
+      this._worker.on('message', onReadyMsg);
+      // If worker errors before ready, the error handler below rejects;
+      // also wire up a one-shot reject for that path.
+      this._worker.once('error', (err) => {
+        // Only reject if we never resolved (i.e., still waiting for ready)
+        // Otherwise this is handled by the steady-state error handler.
+        try { reject(err); } catch { /* already resolved */ }
+      });
+    });
+
+    this._worker.on('message', (msg) => this._handleWorkerMessage(msg));
+    this._worker.on('exit', (code) => this._handleWorkerExit(code));
+    this._worker.on('error', (err) => this._handleWorkerError(err));
+  }
+
+  /** Steady-state worker message dispatcher. */
+  _handleWorkerMessage(msg) {
+    if (!msg || msg.type === 'ready') return; // ready handled by _workerReady
+    const { id, ok, result, error, stack } = msg;
+    if (typeof id !== 'number') return; // malformed; ignore
+    const pending = this._pendingRequests.get(id);
+    if (!pending) return; // unknown id (already settled or cleared)
+    this._pendingRequests.delete(id);
+    this._queueDepth--;
+    if (ok) {
+      pending.resolve(result);
+    } else {
+      const err = new Error(error || 'worker error');
+      if (stack) err.workerStack = stack;
+      pending.reject(err);
+    }
+  }
+
+  _handleWorkerExit(code) {
+    _workerLog('spine_sqlite_worker_exit', { code });
+    if (this._terminating) return; // expected exit during close()
+    this._handleWorkerCrash();
+  }
+
+  _handleWorkerError(err) {
+    _workerLog('spine_sqlite_worker_error', { error: err.message });
+    // 'error' event is followed by 'exit' which triggers crash recovery;
+    // here we just log + reject pending (defensive — exit handler also rejects).
+  }
+
+  _handleWorkerCrash() {
+    // Reject all pending requests
+    for (const [, pending] of this._pendingRequests) {
+      pending.reject(new WorkerCrashedError('worker crashed; pending request rejected'));
+    }
+    this._pendingRequests.clear();
+    this._queueDepth = 0;
+
+    // Crash recovery: single restart attempt with 30s safety window
+    const now = Date.now();
+    if (this._lastCrashAt && (now - this._lastCrashAt) < 30000) {
+      _workerLog('spine_sqlite_worker_crashed_repeatedly', {
+        first_crash_ms: this._lastCrashAt,
+        second_crash_ms: now,
+        elapsed_ms: now - this._lastCrashAt,
+        action: 'process_exit_for_launchagent_restart',
+      });
+      process.exit(1); // LaunchAgent restarts Spine
+      return;
+    }
+
+    this._lastCrashAt = now;
+    _workerLog('spine_sqlite_worker_respawning');
+    this._worker = null;
+    this._workerReady = null;
+    this._spawnWorker();
+  }
+
+  /**
+   * Send an op message to the worker; return Promise resolving to result
+   * (or rejecting with error). Bounded queue (1000 entries by default)
+   * with WorkerQueueFullError back-pressure. Falls back to sync execution
+   * in test mode (when this._worker is null because db is :memory:).
+   *
+   * @param {string} op - one of: getTotalMailboxDepth, expireMessages,
+   *   getMailboxesUnderPressure, getOrganStateCounts, getEntity, transition,
+   *   updateMailboxStatus, getMailboxDepth, persistEvent
+   * @param {Array} params - positional params to the op handler
+   */
+  async _callWorker(op, params) {
+    if (this._queueDepth >= this._maxPendingRequests) {
+      throw new WorkerQueueFullError(
+        `worker queue full (${this._maxPendingRequests}); op=${op}`
+      );
+    }
+
+    // Lazy await readiness (worker spawned in constructor; readiness signal
+    // comes async; first async caller waits for it)
+    if (this._workerReady) {
+      await this._workerReady;
+    }
+
+    return new Promise((resolve, reject) => {
+      const id = this._nextRequestId++;
+      this._pendingRequests.set(id, { resolve, reject });
+      this._queueDepth++;
+      try {
+        this._worker.postMessage({ id, op, params });
+      } catch (err) {
+        this._pendingRequests.delete(id);
+        this._queueDepth--;
+        reject(err);
+      }
+    });
+  }
+
+  // --- 9 async parallel methods (preserve sync API; route through worker
+  //     when available, fall back to sync in test mode) ---
+
+  /** @returns {Promise<number>} */
+  async getTotalMailboxDepthAsync() {
+    if (!this._worker) return this.getTotalMailboxDepth();
+    return this._callWorker('getTotalMailboxDepth', []);
+  }
+
+  /** @returns {Promise<number>} */
+  async expireMessagesAsync() {
+    if (!this._worker) return this.expireMessages();
+    return this._callWorker('expireMessages', []);
+  }
+
+  /** @returns {Promise<Array<{target_organ: string, depth: number}>>} */
+  async getMailboxesUnderPressureAsync(threshold) {
+    if (!this._worker) return this.getMailboxesUnderPressure(threshold);
+    return this._callWorker('getMailboxesUnderPressure', [threshold]);
+  }
+
+  /** @returns {Promise<Object<string, number>>} */
+  async getOrganStateCountsAsync() {
+    if (!this._worker) return this.getOrganStateCounts();
+    return this._callWorker('getOrganStateCounts', []);
+  }
+
+  /** @returns {Promise<Object|null>} */
+  async getEntityAsync(entityUrn) {
+    if (!this._worker) return this.getEntity(entityUrn);
+    return this._callWorker('getEntity', [entityUrn]);
+  }
+
+  /** @returns {Promise<Object|null>} */
+  async transitionAsync(entityUrn, fromState, toState, transitionId, reason, actor) {
+    if (!this._worker) return this.transition(entityUrn, fromState, toState, transitionId, reason, actor);
+    return this._callWorker('transition', [entityUrn, fromState, toState, transitionId, reason, actor]);
+  }
+
+  /** @returns {Promise<{success: true}>} */
+  async updateMailboxStatusAsync(organName, status) {
+    if (!this._worker) {
+      this.updateMailboxStatus(organName, status);
+      return { success: true };
+    }
+    return this._callWorker('updateMailboxStatus', [organName, status]);
+  }
+
+  /** @returns {Promise<number>} */
+  async getMailboxDepthAsync(organName) {
+    if (!this._worker) return this.getMailboxDepth(organName);
+    return this._callWorker('getMailboxDepth', [organName]);
+  }
+
+  /** @returns {Promise<{urn: string, created_at: string}>} */
+  async persistEventAsync(envelope, routing) {
+    if (!this._worker) return this.persistEvent(envelope, routing);
+    return this._callWorker('persistEvent', [envelope, routing]);
+  }
+
   close() {
+    this._terminating = true;
+    if (this._worker) {
+      try { this._worker.terminate(); } catch { /* ignore */ }
+      this._worker = null;
+    }
+    // Reject any pending requests
+    for (const [, pending] of this._pendingRequests) {
+      pending.reject(new WorkerCrashedError('adapter closed'));
+    }
+    this._pendingRequests.clear();
+    this._queueDepth = 0;
     this._db.close();
   }
 }

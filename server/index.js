@@ -105,6 +105,34 @@ function emitMessage(envelope) {
   return result;
 }
 
+// Phase-2 Strand 3 (binding-rule #40): async parallel of emitMessage that
+// uses adapter.persistEventAsync (worker-thread offload) for the audit-trail
+// persist. Routing remains in-memory sync (no DB ops). Used by lifecycle
+// callbacks to keep DB writes off the event-loop main thread.
+// Per EA Verdict 3 ratification 2026-05-09 1428 R.
+async function emitMessageAsync(envelope) {
+  const result = routeMessage(envelope, {
+    manifest,
+    subscriptionCache: wsHandler.getSubscriptionCache(),
+    pushToOrgan: wsHandler.pushToOrgan,
+    isOrganConnected: wsHandler.isOrganConnected,
+    adapter,
+  });
+
+  const routing = envelope.target_organ === '*' ? 'broadcast' : 'directed';
+  await adapter.persistEventAsync(envelope, routing);
+
+  if (result.error) {
+    log('emit_message_routing_failed', {
+      message_id: envelope.message_id,
+      target_organ: envelope.target_organ,
+      error: result.error,
+    });
+  }
+
+  return result;
+}
+
 // Relay 6: Wire health monitoring dependencies (late binding to resolve circular deps)
 const healthConfig = {
   pingIntervalMs: config.pingIntervalMs,
@@ -119,6 +147,8 @@ const healthConfig = {
 wsHandler.setHealthDependencies({
   stateMachine,
   emitMessage,
+  emitMessageAsync,
+  adapter,  // expose adapter for direct *Async access in lifecycle callbacks
   healthConfig,
 });
 

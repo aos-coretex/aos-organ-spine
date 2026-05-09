@@ -171,7 +171,14 @@ export function createWebSocketHandler(adapter, manifest) {
    * 6. Check manifest — start reconnection timer for required organs
    * 7. Emit organ_disconnected Vigil OTM broadcast
    */
-  function executeDisconnectSequence(organName, ws, reason) {
+  // Phase-2 Strand 3 (binding-rule #40): executeDisconnectSequence migrates
+  // outright per EA Verdict 3 — single-caller path via heartbeat onDisconnect
+  // callback + ws.on('close')/('error'); no parallel sync version needed.
+  // DB ops route through worker via adapter *Async methods + emitMessageAsync.
+  // Note: bypasses stateMachine.transition wrapper (state_transition OTM emit
+  // skipped for lifecycle transitions; organ_disconnected OTM still emitted
+  // via emitMessageAsync below). Forward-cache flagged for EA architect-review.
+  async function executeDisconnectSequence(organName, ws, reason) {
     const state = clients.get(ws);
     if (!state) return; // already handled (idempotent guard)
 
@@ -191,20 +198,19 @@ export function createWebSocketHandler(adapter, manifest) {
 
     if (!organName) return;
 
-    // Update mailbox status
-    adapter.updateMailboxStatus(organName, 'disconnected');
+    // Update mailbox status (worker)
+    await adapter.updateMailboxStatusAsync(organName, 'disconnected');
 
-    // Transition organ state to DISCONNECTED
-    if (healthDeps?.stateMachine) {
-      const entity = healthDeps.stateMachine.getEntity(`organ:${organName}`);
-      if (entity && !entity.error) {
-        const fromState = entity.current_state;
-        if (fromState === 'ALIVE' || fromState === 'DEGRADED') {
-          healthDeps.stateMachine.transition(
-            `organ:${organName}`, fromState, 'DISCONNECTED',
-            reason, 'Spine',
-          );
-        }
+    // Transition organ state to DISCONNECTED (worker)
+    const entity = await adapter.getEntityAsync(`organ:${organName}`);
+    if (entity) {
+      const fromState = entity.current_state;
+      if (fromState === 'ALIVE' || fromState === 'DEGRADED') {
+        const transitionId = generateUrn('transition');
+        await adapter.transitionAsync(
+          `organ:${organName}`, fromState, 'DISCONNECTED',
+          transitionId, reason, 'Spine',
+        );
       }
     }
 
@@ -222,9 +228,12 @@ export function createWebSocketHandler(adapter, manifest) {
     }
 
     // Emit organ_disconnected Vigil OTM broadcast
-    if (healthDeps?.emitMessage) {
-      const depth = adapter.getMailboxDepth(organName);
-      healthDeps.emitMessage({
+    // Phase-2 Strand 3: prefer emitMessageAsync (worker offload); fall back to
+    // emitMessage in test mode where healthDeps doesn't include async parallel.
+    const emit = healthDeps?.emitMessageAsync || healthDeps?.emitMessage;
+    if (emit) {
+      const depth = await adapter.getMailboxDepthAsync(organName);
+      const envelope = {
         type: 'OTM',
         source_organ: 'Spine',
         target_organ: '*',
@@ -242,38 +251,52 @@ export function createWebSocketHandler(adapter, manifest) {
             mailbox_depth: depth,
           },
         },
-      });
+      };
+      const r = emit(envelope);
+      if (r && typeof r.then === 'function') await r;
     }
 
     log('ws_organ_disconnected', { organ: organName, reason });
   }
 
   /**
-   * Handle organ entering DEGRADED state (1 missed pong).
+   * Handle organ entering DEGRADED state (2 consecutive missed pongs per
+   * Phase-2 Strand 1 threshold).
+   *
+   * Phase-2 Strand 3: async; routes DB ops through worker (binding-rule #40).
+   * Bypasses stateMachine.transition wrapper for the 12-path-bounded
+   * migration; pre-validates via current_state check; lifecycle transitions
+   * (ALIVE↔DEGRADED, ALIVE/DEGRADED→DISCONNECTED) are pre-validated by
+   * organ state machine def at boot.
    */
-  function handleOrganDegraded(organName) {
-    if (!healthDeps?.stateMachine || !organName) return;
+  async function handleOrganDegraded(organName) {
+    if (!organName) return;
 
-    const entity = healthDeps.stateMachine.getEntity(`organ:${organName}`);
-    if (entity && !entity.error && entity.current_state === 'ALIVE') {
-      healthDeps.stateMachine.transition(
+    const entity = await adapter.getEntityAsync(`organ:${organName}`);
+    if (entity && entity.current_state === 'ALIVE') {
+      const transitionId = generateUrn('transition');
+      await adapter.transitionAsync(
         `organ:${organName}`, 'ALIVE', 'DEGRADED',
-        'missed_pong', 'Spine',
+        transitionId, 'missed_pong', 'Spine',
       );
     }
   }
 
   /**
    * Handle organ recovering from DEGRADED state (pong received after miss).
+   *
+   * Phase-2 Strand 3: async; routes DB ops through worker (binding-rule #40).
+   * Same bypass-stateMachine pattern as handleOrganDegraded.
    */
-  function handleOrganRecovered(organName) {
-    if (!healthDeps?.stateMachine || !organName) return;
+  async function handleOrganRecovered(organName) {
+    if (!organName) return;
 
-    const entity = healthDeps.stateMachine.getEntity(`organ:${organName}`);
-    if (entity && !entity.error && entity.current_state === 'DEGRADED') {
-      healthDeps.stateMachine.transition(
+    const entity = await adapter.getEntityAsync(`organ:${organName}`);
+    if (entity && entity.current_state === 'DEGRADED') {
+      const transitionId = generateUrn('transition');
+      await adapter.transitionAsync(
         `organ:${organName}`, 'DEGRADED', 'ALIVE',
-        'pong_recovered', 'Spine',
+        transitionId, 'pong_recovered', 'Spine',
       );
     }
   }
@@ -291,13 +314,14 @@ export function createWebSocketHandler(adapter, manifest) {
    * 4. Check critical missing required organs -> emit HOM to human-principal
    * 5. Emit spine_health OTM broadcast
    */
-  function performHealthCheck() {
+  async function performHealthCheck() {
     const sqliteOk = adapter.healthCheck();
     const connectedOrgans = getClientCount();
-    const totalMailboxDepth = adapter.getTotalMailboxDepth();
+    // Phase-2 Strand 3: route 12-path queries through worker (binding-rule #40)
+    const totalMailboxDepth = await adapter.getTotalMailboxDepthAsync();
 
-    // TTL expiry sweep
-    const expiredCount = adapter.expireMessages();
+    // TTL expiry sweep (worker)
+    const expiredCount = await adapter.expireMessagesAsync();
     if (expiredCount > 0) {
       log('mailbox_ttl_expired', { expired_count: expiredCount });
     }
@@ -320,14 +344,16 @@ export function createWebSocketHandler(adapter, manifest) {
 
         if (!criticalAlertsSent.has(organName)) {
           criticalAlertsSent.add(organName);
-          emitCriticalMissingHom(organName, now - disconnectTime);
+          await emitCriticalMissingHom(organName, now - disconnectTime);
         }
       }
     }
 
     // Emit spine_health OTM broadcast
-    if (healthDeps?.emitMessage) {
-      healthDeps.emitMessage({
+    // Phase-2 Strand 3: prefer emitMessageAsync; fall back to emitMessage.
+    const emit = healthDeps?.emitMessageAsync || healthDeps?.emitMessage;
+    if (emit) {
+      const envelope = {
         type: 'OTM',
         source_organ: 'Spine',
         target_organ: '*',
@@ -346,19 +372,27 @@ export function createWebSocketHandler(adapter, manifest) {
             sqlite_ok: sqliteOk,
           },
         },
-      });
+      };
+      const r = emit(envelope);
+      if (r && typeof r.then === 'function') await r;
     }
   }
 
   /**
    * Emit HOM for a critical missing required organ.
    * Directed to human-principal mailbox — persists until drained.
+   *
+   * Phase-2 Strand 3: async; routes via emitMessageAsync (worker offload of
+   * persistEvent) so HOM emits during disconnect-storm scenarios don't pile
+   * up sync DB ops on the event-loop main thread.
    */
-  function emitCriticalMissingHom(organName, elapsedMs) {
-    if (!healthDeps?.emitMessage) return;
+  async function emitCriticalMissingHom(organName, elapsedMs) {
+    // Phase-2 Strand 3: prefer emitMessageAsync; fall back to emitMessage.
+    const emit = healthDeps?.emitMessageAsync || healthDeps?.emitMessage;
+    if (!emit) return;
 
     const elapsedMinutes = Math.floor(elapsedMs / 60_000);
-    healthDeps.emitMessage({
+    const envelope = {
       type: 'HOM',
       source_organ: 'Spine',
       target_organ: 'human-principal',
@@ -373,7 +407,9 @@ export function createWebSocketHandler(adapter, manifest) {
         options: ['investigate', 'acknowledge_degraded'],
         deadline: null,
       },
-    });
+    };
+    const r = emit(envelope);
+    if (r && typeof r.then === 'function') await r;
 
     log('hom_critical_missing_organ', { organ: organName, elapsed_minutes: elapsedMinutes });
   }
@@ -634,8 +670,12 @@ export function createWebSocketHandler(adapter, manifest) {
         if (state) {
           const wasDegraded = heartbeat.handlePong(state);
           // Relay 6: recover from DEGRADED -> ALIVE
+          // Phase-2 Strand 3: handleOrganRecovered is async; .catch wrapper
+          // prevents unhandled-promise-rejection from crashing event loop.
           if (wasDegraded && state.organName) {
-            handleOrganRecovered(state.organName);
+            handleOrganRecovered(state.organName).catch((err) =>
+              log('handleOrganRecovered_error', { error: err.message, organ: state.organName }),
+            );
           }
         }
       });
@@ -645,7 +685,10 @@ export function createWebSocketHandler(adapter, manifest) {
       ws.on('close', () => {
         const state = clients.get(ws);
         if (state && state.organName) {
-          executeDisconnectSequence(state.organName, ws, 'clean_disconnect');
+          // Phase-2 Strand 3: executeDisconnectSequence is async
+          executeDisconnectSequence(state.organName, ws, 'clean_disconnect').catch((err) =>
+            log('executeDisconnectSequence_error', { error: err.message, organ: state.organName }),
+          );
         } else {
           clients.delete(ws);
         }
@@ -655,7 +698,10 @@ export function createWebSocketHandler(adapter, manifest) {
         log('ws_client_error', { error: err.message });
         const state = clients.get(ws);
         if (state && state.organName) {
-          executeDisconnectSequence(state.organName, ws, 'error');
+          // Phase-2 Strand 3: executeDisconnectSequence is async
+          executeDisconnectSequence(state.organName, ws, 'error').catch((werr) =>
+            log('executeDisconnectSequence_error', { error: werr.message, organ: state.organName }),
+          );
         } else {
           clients.delete(ws);
         }
@@ -671,13 +717,28 @@ export function createWebSocketHandler(adapter, manifest) {
     });
 
     // Start heartbeat ping cycle with lifecycle callbacks
+    // Phase-2 Strand 3: lifecycle callbacks are async; .catch wrappers prevent
+    // unhandled-promise-rejection from crashing event loop on setInterval-fire.
     heartbeat.startPingCycle(clients, {
-      onDegraded: handleOrganDegraded,
-      onDisconnect: (organName, ws) => executeDisconnectSequence(organName, ws, 'heartbeat_timeout'),
+      onDegraded: (organName) => {
+        handleOrganDegraded(organName).catch((err) =>
+          log('handleOrganDegraded_error', { error: err.message, organ: organName }),
+        );
+      },
+      onDisconnect: (organName, ws) => {
+        executeDisconnectSequence(organName, ws, 'heartbeat_timeout').catch((err) =>
+          log('executeDisconnectSequence_error', { error: err.message, organ: organName }),
+        );
+      },
     });
 
     // Start health self-check cycle (includes TTL sweep)
-    heartbeat.startHealthCheck(performHealthCheck);
+    // Phase-2 Strand 3: performHealthCheck is async; .catch wrapper required.
+    heartbeat.startHealthCheck(() => {
+      performHealthCheck().catch((err) =>
+        log('performHealthCheck_error', { error: err.message }),
+      );
+    });
 
     log('ws_server_attached', { path: '/subscribe' });
   }
