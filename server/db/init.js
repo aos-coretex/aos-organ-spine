@@ -115,6 +115,23 @@ export function initDatabase(dbPath) {
     CREATE INDEX IF NOT EXISTS idx_mailbox_messages_created
       ON mailbox_messages(created_at);
 
+    -- Phase-1 wedge-fix (2026-05-09 spine-wedge-recurrence-prevention):
+    -- The four health-check queries that fire on the 60s setInterval tick
+    -- previously planned as SCAN TABLE, allowing the empirical 6-day wedge
+    -- on _totalMailboxDepth (sqlite.js:239-241). These three indexes turn
+    -- the wedge call sites into SEARCH USING INDEX. Per E-ORG spec
+    -- 2026-05-09 spine-wedge-fix-relay-prompt-body.md.
+
+    CREATE INDEX IF NOT EXISTS idx_mailbox_messages_delivered
+      ON mailbox_messages(delivered);
+
+    CREATE INDEX IF NOT EXISTS idx_mailbox_messages_delivered_ttl
+      ON mailbox_messages(delivered, ttl_seconds)
+      WHERE ttl_seconds IS NOT NULL AND delivered = 0;
+
+    CREATE INDEX IF NOT EXISTS idx_state_entities_type_state
+      ON state_entities(entity_type, current_state);
+
     -- Relay 3: schema changelog for message type schema evolution
 
     CREATE TABLE IF NOT EXISTS schema_changelog (

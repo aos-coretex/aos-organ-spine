@@ -236,21 +236,36 @@ export class SQLiteStorageAdapter extends StorageAdapter {
         AND (julianday('now') - julianday(created_at)) * 86400 > ttl_seconds
     `);
 
+    // Phase-1 wedge-fix (2026-05-09 spine-wedge-recurrence-prevention):
+    // Strand 2 — LIMIT clauses + COUNT short-circuiting (defense-in-depth).
+    // The COUNT(*) is wrapped in a subquery LIMIT 1_000_000 so worst-case
+    // scan cost is bounded; if undelivered mailbox depth exceeds 1M, the
+    // count saturates at 1M which carries enough signal for health/alerting
+    // (>1M backlog is itself a critical-condition signal regardless of
+    // exact count). Per E-ORG spec 2026-05-09 spine-wedge-fix-relay-prompt-body.md.
     this._totalMailboxDepth = db.prepare(
-      'SELECT COUNT(*) as count FROM mailbox_messages WHERE delivered = 0'
+      'SELECT COUNT(*) as count FROM (SELECT 1 FROM mailbox_messages WHERE delivered = 0 LIMIT 1000000)'
     );
 
+    // Phase-1 wedge-fix Strand 2: bounded result-set safety net.
+    // N organs is small (~30) so LIMIT 100 is non-active under normal
+    // conditions but caps worst-case under degraded GROUP BY plans.
     this._mailboxesUnderPressure = db.prepare(`
       SELECT target_organ, COUNT(*) as depth FROM mailbox_messages
       WHERE delivered = 0
       GROUP BY target_organ
       HAVING depth > ?
+      LIMIT 100
     `);
 
+    // Phase-1 wedge-fix Strand 2: bounded result-set safety net.
+    // N organ states is small (~5-10) so LIMIT 100 is non-active under normal
+    // conditions but caps worst-case under degraded GROUP BY plans.
     this._organStateCounts = db.prepare(`
       SELECT current_state, COUNT(*) as count FROM state_entities
       WHERE entity_type = 'organ'
       GROUP BY current_state
+      LIMIT 100
     `);
 
     // --- Diagnostics ---
