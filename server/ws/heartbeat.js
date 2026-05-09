@@ -38,10 +38,30 @@ export function createHeartbeatMonitor({
    *
    * Every pingIntervalMs, for each connected WebSocket client:
    *   missedPongs >= maxMissedPongs  -> onDisconnect callback
-   *   missedPongs incremented to 1   -> onDegraded callback
+   *   missedPongs reaches 2          -> onDegraded callback (sustained miss)
    *   Otherwise                      -> increment + send ping frame
    *
-   * @param {Map} clients - Map<WebSocket, { organName, connectedAt, missedPongs, lastPongAt }>
+   * Phase-2 wedge-fix (2026-05-09 spine-wedge-fix-phase2-relay-prompt-body.md):
+   * The DEGRADED threshold was previously `=== 1` which triggered onDegraded
+   * for every healthy organ on every ping tick (BEFORE the pong-timeout window
+   * elapsed). Healthy organs that responded to every ping experienced
+   * defensive-bookkeeping round-trip (DEGRADED→ALIVE) every 30s, generating
+   * 56 spurious state_transitions rows per tick (28 organs × 2 transitions),
+   * which both wedged the event-loop on lifecycle-callback sync DB writes
+   * (28 × 6 ops × ~30ms = 5040ms ≈ 5s observed stall) AND amplified the
+   * Phase-1 SCAN-TABLE class via cumulative spurious rows.
+   *
+   * Threshold raised to `=== 2` so DEGRADED only fires after SECOND consecutive
+   * missed ping (one missed ping is normal jitter; sustained miss signals
+   * degradation). maxMissedPongs (default 3) still triggers disconnect at
+   * 90s without pong; unchanged.
+   *
+   * Option B `degradedNotified` boolean (preferred over A: more robust to
+   * future threshold changes): set when onDegraded fires; reset on pong;
+   * handlePong returns wasDegraded based on this explicit signal rather
+   * than missedPongs counter inference.
+   *
+   * @param {Map} clients - Map<WebSocket, { organName, connectedAt, missedPongs, lastPongAt, degradedNotified }>
    * @param {object} callbacks
    * @param {function} callbacks.onDegraded    - (organName) organ entered warning state
    * @param {function} callbacks.onDisconnect  - (organName, ws) organ is dead
@@ -57,9 +77,11 @@ export function createHeartbeatMonitor({
 
         state.missedPongs++;
 
-        // Degraded detection at first missed pong
-        if (state.missedPongs === 1 && state.organName) {
+        // Phase-2 wedge-fix: DEGRADED only on SECOND consecutive missed ping
+        // (one missed ping is normal jitter; sustained miss signals degradation).
+        if (state.missedPongs === 2 && state.organName) {
           callbacks.onDegraded(state.organName);
+          state.degradedNotified = true;
         }
 
         try { ws.ping(); } catch { /* ignore send errors on dead sockets */ }
@@ -71,12 +93,20 @@ export function createHeartbeatMonitor({
    * Handle pong received from a client.
    * Updates lastPongAt and resets missedPongs.
    *
+   * Phase-2 wedge-fix: wasDegraded is now driven by the explicit
+   * `degradedNotified` boolean (Option B), not the missedPongs counter.
+   * This decouples the recovery-signal from the threshold counter so future
+   * threshold tuning doesn't break the recovery semantics. Healthy organs
+   * (missedPongs 0→1→0 with no degraded firing) return wasDegraded=false,
+   * eliminating the spurious onRecovered round-trip.
+   *
    * @param {object} state - Client state object from the clients Map
-   * @returns {boolean} true if the client had missed pongs (was degraded/recovering)
+   * @returns {boolean} true if onDegraded was called (recovery is meaningful)
    */
   function handlePong(state) {
-    const wasDegraded = state.missedPongs > 0;
+    const wasDegraded = !!state.degradedNotified;
     state.missedPongs = 0;
+    state.degradedNotified = false;
     state.lastPongAt = new Date().toISOString();
     return wasDegraded;
   }
