@@ -201,13 +201,15 @@ export function createWebSocketHandler(adapter, manifest) {
     // Update mailbox status (worker)
     await adapter.updateMailboxStatusAsync(organName, 'disconnected');
 
-    // Transition organ state to DISCONNECTED (worker)
+    // Transition organ state to DISCONNECTED (worker via stateMachine.transitionAsync
+    // per §10.2 patch — restores onTransition callback emit for state_transition
+    // OTM consumed by Axon, Cortex, ModelBroker, Receptor)
     const entity = await adapter.getEntityAsync(`organ:${organName}`);
-    if (entity) {
+    if (entity && healthDeps?.stateMachine?.transitionAsync) {
       const fromState = entity.current_state;
       if (fromState === 'ALIVE' || fromState === 'DEGRADED') {
         const transitionId = generateUrn('transition');
-        await adapter.transitionAsync(
+        await healthDeps.stateMachine.transitionAsync(
           `organ:${organName}`, fromState, 'DISCONNECTED',
           transitionId, reason, 'Spine',
         );
@@ -270,12 +272,14 @@ export function createWebSocketHandler(adapter, manifest) {
    * organ state machine def at boot.
    */
   async function handleOrganDegraded(organName) {
-    if (!organName) return;
+    if (!organName || !healthDeps?.stateMachine?.transitionAsync) return;
 
     const entity = await adapter.getEntityAsync(`organ:${organName}`);
     if (entity && entity.current_state === 'ALIVE') {
       const transitionId = generateUrn('transition');
-      await adapter.transitionAsync(
+      // §10.2 patch: route through stateMachine.transitionAsync to preserve
+      // onTransition callback emit (state_transition OTM for 4-organ consumer set)
+      await healthDeps.stateMachine.transitionAsync(
         `organ:${organName}`, 'ALIVE', 'DEGRADED',
         transitionId, 'missed_pong', 'Spine',
       );
@@ -285,16 +289,19 @@ export function createWebSocketHandler(adapter, manifest) {
   /**
    * Handle organ recovering from DEGRADED state (pong received after miss).
    *
-   * Phase-2 Strand 3: async; routes DB ops through worker (binding-rule #40).
-   * Same bypass-stateMachine pattern as handleOrganDegraded.
+   * Phase-2 Strand 3 + §10.2 patch: async; routes DB ops through worker via
+   * stateMachine.transitionAsync (binding-rule #40 + state_transition OTM
+   * preservation for 4-organ consumer set per EA 1502 R architect-review).
    */
   async function handleOrganRecovered(organName) {
-    if (!organName) return;
+    if (!organName || !healthDeps?.stateMachine?.transitionAsync) return;
 
     const entity = await adapter.getEntityAsync(`organ:${organName}`);
     if (entity && entity.current_state === 'DEGRADED') {
       const transitionId = generateUrn('transition');
-      await adapter.transitionAsync(
+      // §10.2 patch: route through stateMachine.transitionAsync (preserves
+      // onTransition emit for state_transition OTM)
+      await healthDeps.stateMachine.transitionAsync(
         `organ:${organName}`, 'DEGRADED', 'ALIVE',
         transitionId, 'pong_recovered', 'Spine',
       );

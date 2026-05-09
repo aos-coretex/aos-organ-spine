@@ -162,12 +162,70 @@ export function createStateMachine(adapter, options = {}) {
     };
   }
 
+  /**
+   * Async parallel of transition() — Phase-2 Strand 3 §10.2 patch
+   * (binding-rule #40 architectural-class closure for lifecycle callback chain).
+   *
+   * Mirrors transition() shape but routes the persistence write through
+   * adapter.transitionAsync (worker thread). Preserves the onTransition
+   * callback emit chain — load-bearing for state_transition OTM consumers
+   * Axon, Cortex, ModelBroker, Receptor (4-organ subscriber set verified
+   * empirically by EA 1502 R architect-review grep).
+   *
+   * Validation pre-check is intentionally NOT duplicated here — lifecycle
+   * callsite callers (handleOrganDegraded, handleOrganRecovered,
+   * executeDisconnectSequence) perform inline current_state pre-check
+   * matching the existing sync-path inline pattern, per EA 1502 R guidance.
+   * Future async lifecycle callers can layer the same inline guard, OR
+   * the wrapper can be extended with the full validation suite when async
+   * migration completes for non-lifecycle callers.
+   *
+   * Per EA 1502 R architect-review verdict (path a ratified) + ESB-I
+   * 1503 R dispatch + Verdict 4 staged-commit (Option β new commit
+   * on top of e708566).
+   *
+   * @param {string} entityUrn - canonical entity URN
+   * @param {string} fromState - expected current_state (compare-and-swap; caller pre-checks)
+   * @param {string} toState - target state
+   * @param {string} transitionId - URN for the new state_transitions row (caller-supplied)
+   * @param {string} reason - human-readable transition reason
+   * @param {string} actor - originating organ/system identifier
+   * @returns {Promise<Object>} updated entity (mirrors sync transition() return shape)
+   */
+  async function transitionAsync(entityUrn, fromState, toState, transitionId, reason, actor) {
+    // Route persistence through worker (binding-rule #40)
+    const result = await adapter.transitionAsync(
+      entityUrn, fromState, toState, transitionId, reason, actor,
+    );
+
+    // Relay 4: emit state_transition OTM broadcast (preserved across async path
+    // per EA 1502 R path (a) ratification — load-bearing for 4-organ consumer set)
+    if (onTransition && result && !result.error) {
+      try {
+        onTransition({
+          entity_urn: entityUrn,
+          previous_state: fromState,
+          current_state: result.current_state,
+          transition_id: transitionId,
+          timestamp: result.updated_at,
+          actor,
+          reason,
+        });
+      } catch {
+        // Do not let emission failure break the transition (matches sync path)
+      }
+    }
+
+    return result;
+  }
+
   return {
     registerMachine,
     getMachineDefinition,
     getAllMachineDefinitions,
     createEntity,
     transition,
+    transitionAsync,
     getEntity,
   };
 }
